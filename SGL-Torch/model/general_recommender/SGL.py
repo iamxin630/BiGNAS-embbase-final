@@ -217,7 +217,7 @@ class SGL(AbstractRecommender):
         self.num_users, self.num_items, self.num_ratings = self.dataset.num_users, self.dataset.num_items, self.dataset.num_train_ratings
 
         # === 指定 Group A: 買過 target item 的 users ===
-        group_a_ids = [50, 98, 118, 191, 260, 550, 735, 947, 1175, 1615]
+        group_a_ids = [50, 99, 119, 191, 260, 550, 735, 946, 1175, 1615]
         self.user_group_tensor = torch.zeros(self.num_users, dtype=torch.long)
         self.user_group_tensor[group_a_ids] = 1  # 1: Group A, 0: 其他
 
@@ -419,7 +419,7 @@ class SGL(AbstractRecommender):
         try:
             print("\n\n================= Hard User / Hard Item Analysis =================")
             # 1️⃣ 定義 Group A
-            groupA_ids = [50, 98, 118, 191, 260, 550, 735, 947, 1175, 1615]
+            groupA_ids = [50, 99, 119, 191, 260, 550, 735, 946, 1175, 1615]
 
             # 2️⃣ 計算 Hard Users（根據 cosine distance）
             with torch.no_grad():
@@ -432,22 +432,22 @@ class SGL(AbstractRecommender):
                 sim = torch.matmul(user_emb[B], user_emb[A].T)
                 max_sim, _ = sim.max(dim=1)
                 dist = 1 - max_sim
-                k_hard = int(len(B) * 0.1)  # top 10%
+                k_hard = int(len(B) * 0.01) # top 1%
                 hard_user_ids = B[torch.topk(dist, k=k_hard).indices].cpu().tolist()
                 print(f"選出 {len(hard_user_ids)} 位 Hard Users（距離最大 Top10%）")
 
-            E_add_source, E_add_target, top_src, top_tgt = find_hard_items_and_export_verbose(
-                model=self,   # ✅ 注意這裡是 self，不是 sgl_model
+            E_add_source, top_src = find_hard_items_and_export_verbose(
+                model=self,
                 groupA_ids=groupA_ids,
                 hard_user_ids=hard_user_ids,
-                num_users=self.num_users,
-                num_source_items=self.dataset.num_source_items,
-                num_target_items=self.dataset.num_target_items,
-                k_source=,   # ✅ 你想補多少 source items
-                k_target=0,    # ✅ 你想補多少 target items
+                num_users=2809,
+                num_source_items=28253,
+                num_target_items=14274,
+                k_source=5,             # 你指定的每個 Hard User 要加的 source 邊數
                 save_dir="logs/hard_item_split_v2",
-                preview_top_users = 3 
+                preview_top_users=30
             )
+
 
             print("================= Hard Item Analysis Done =================\n\n")
 
