@@ -216,12 +216,50 @@ class SGL(AbstractRecommender):
 
         self.num_users, self.num_items, self.num_ratings = self.dataset.num_users, self.dataset.num_items, self.dataset.num_train_ratings
 
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+        # ============================================================
+        # [NEW] 1. 個性化溫度預計算 (Log-Normalization)
+        # ============================================================
+        # 1. 取得 User-Item 交互矩陣並轉為 CSR 格式
+        train_matrix = self.dataset.train_data.to_csr_matrix()
+        
+        # 2. 計算 Degree (每個 User 的交互總數)
+        # sum(axis=1) 得到 (num_users, 1)，squeeze 轉為一維陣列
+        user_degrees = np.array(train_matrix.sum(axis=1)).squeeze()
+        
+        # 3. 防止 Degree 為 0 (數值安全)
+        user_degrees[user_degrees == 0] = 1 
+
+        # 4. 設定溫度範圍 [tau_min, tau_max]
+        # 冷門用戶 -> 0.1 (強梯度); 熱門用戶 -> 0.5 (弱梯度)
+        tau_min = 0.1
+        tau_max = 0.5
+        
+        # 5. Log-Normalization 核心計算
+        log_degrees = np.log(user_degrees + 1e-5) 
+        v_min = log_degrees.min()
+        v_max = log_degrees.max()
+        
+        # 歸一化到 [0, 1]
+        if v_max - v_min > 0:
+            norm_degrees = (log_degrees - v_min) / (v_max - v_min)
+        else:
+            norm_degrees = np.zeros_like(log_degrees)
+
+        # 映射到 [0.1, 0.5]
+        user_temps_np = tau_min + norm_degrees * (tau_max - tau_min)
+        
+        # 6. 轉為 Tensor 並存入 GPU
+        self.user_temps = torch.FloatTensor(user_temps_np).to(self.device)
+        
+        self.logger.info(f"[Personalized Temp] Range: [{self.user_temps.min():.4f}, {self.user_temps.max():.4f}]")
+        # ============================================================
+
         # === 指定 Group A: 買過 target item 的 users ===
         group_a_ids = [50, 99, 119, 191, 260, 550, 735, 946, 1175, 1615]
         self.user_group_tensor = torch.zeros(self.num_users, dtype=torch.long)
         self.user_group_tensor[group_a_ids] = 1  # 1: Group A, 0: 其他
-
-        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         adj_matrix = self.create_adj_mat()
         adj_matrix = sp_mat_to_sp_tensor(adj_matrix).to(self.device)
 
@@ -314,10 +352,26 @@ class SGL(AbstractRecommender):
                     self.lightgcn.item_embeddings(bat_neg_items),
                 )
 
-                # InfoNCE Loss
-                clogits_user = torch.logsumexp(ssl_logits_user / self.ssl_temp, dim=1)
+                # ============================================================
+                # [MODIFIED] 2. 應用個性化溫度計算 InfoNCE Loss
+                # ============================================================
+                
+                # --- User Side (使用個性化溫度) ---
+                # 1. 根據當前 batch 的 user id 取出對應溫度
+                # self.user_temps[bat_users] -> [batch_size]
+                # unsqueeze(1) -> [batch_size, 1] 為了讓 PyTorch 做廣播除法
+                batch_user_temps = self.user_temps[bat_users].unsqueeze(1)
+                
+                # 2. 除以動態溫度 (每個 User 除以自己的 tau)
+                clogits_user = torch.logsumexp(ssl_logits_user / batch_user_temps, dim=1)
+                
+                # --- Item Side (保持使用全域固定溫度) ---
+                # 根據方案 A，Item 繼續使用 self.ssl_temp
                 clogits_item = torch.logsumexp(ssl_logits_item / self.ssl_temp, dim=1)
+                
+                # 總和 InfoNCE Loss
                 infonce_loss = torch.sum(clogits_user + clogits_item)
+                # ============================================================
                 
                 # === Group Contrastive Loss ===
                 user_embs1 = F.embedding(bat_users, F.normalize(self.lightgcn._forward_gcn(sub_graph1)[0], dim=1))
@@ -352,9 +406,17 @@ class SGL(AbstractRecommender):
                 total_loss += loss
                 total_bpr_loss += bpr_loss
                 total_reg_loss += self.reg * reg_loss
+                
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
+                
+                # 清理不需要的變量以節省內存
+                del loss, bpr_loss, reg_loss, infonce_loss, group_loss, graph_loss
+                del clogits_user, clogits_item, batch_user_temps
+                del user_embs1, user_embs2, user_embs_g1, user_embs_g2, item_embs_g1, item_embs_g2
+                del z_g1, z_g2, user_group_tensor
+                torch.cuda.empty_cache()
 
             self.logger.info("[iter %d : loss : %.4f = %.4f + %.4f + %.4f, time: %f]" % (
                 epoch, 
@@ -432,7 +494,7 @@ class SGL(AbstractRecommender):
                 sim = torch.matmul(user_emb[B], user_emb[A].T)
                 max_sim, _ = sim.max(dim=1)
                 dist = 1 - max_sim
-                k_hard = int(len(B) * 0.01) # top 1%
+                k_hard = int(len(B) * 0.005) # top 0.5%
                 hard_user_ids = B[torch.topk(dist, k=k_hard).indices].cpu().tolist()
                 print(f"選出 {len(hard_user_ids)} 位 Hard Users（距離最大 Top10%）")
 
